@@ -25,6 +25,7 @@ import time
 import re
 import http.server
 import socketserver
+import socket
 
 # Suppress DeprecationWarning for event loop
 warnings.filterwarnings("ignore", category=DeprecationWarning, message="There is no current event loop")
@@ -86,8 +87,9 @@ STATE_PROMPT = "awaiting_prompt"
 STATE_DIMENSION = "awaiting_dimension"
 STATE_IMPROVE = "awaiting_improve"
 
-# Thread-safe lock for in-memory operations
+# Thread-safe lock for in-memory operations and shutdown
 DATA_LOCK = Lock()
+SHUTDOWN_LOCK = Lock()
 USER_STATE = {}  # User states for conversation flow
 
 # HTTP Server for Health Check
@@ -105,17 +107,35 @@ class HTTPServerThread(Thread):
         super().__init__(daemon=True)
         self.port = port
         self.server = None
+        self.success = False
 
     def run(self):
-        try:
-            self.server = socketserver.TCPServer(("", self.port), HealthCheckHandler)
-            self.server.allow_reuse_address = True
-            self.server.server_bind()
-            self.server.server_activate()
-            logger.info(f"HTTP server started on port {self.port}")
-            self.server.serve_forever()
-        except Exception as e:
-            logger.error(f"HTTP server error: {e}")
+        for attempt in range(3):
+            try:
+                # Check if port is available
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1)
+                    result = s.connect_ex(('0.0.0.0', self.port))
+                    if result == 0:
+                        logger.warning(f"Port {self.port} is already in use, retrying in 1s")
+                        time.sleep(1)
+                        continue
+                
+                self.server = socketserver.TCPServer(("", self.port), HealthCheckHandler)
+                self.server.allow_reuse_address = True
+                self.server.server_bind()
+                self.server.server_activate()
+                self.success = True
+                logger.info(f"HTTP server started on port {self.port}")
+                self.server.serve_forever()
+                break
+            except Exception as e:
+                logger.error(f"HTTP server attempt {attempt + 1}/3 failed on port {self.port}: {e}")
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    logger.error(f"Failed to start HTTP server after 3 attempts")
+                    self.success = False
 
     def stop(self):
         if self.server:
@@ -128,7 +148,7 @@ def manage_user_data(user_id, update_usage=None, update_topic_id=None):
     """Manage user data in SQLite database."""
     try:
         with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.cursor()
             cursor.execute("SELECT usage_count, topic_id FROM users WHERE user_id = ?", (user_id,))
             result = cursor.fetchone()
@@ -166,11 +186,12 @@ def manage_user_data(user_id, update_usage=None, update_topic_id=None):
         return {"usage_count": 0, "topic_id": None}
 
 def init_db():
-    """Initialize SQLite database."""
+    """Initialize SQLite database and verify integrity."""
     try:
         Path(CONFIG["DATA_DIR"]).mkdir(exist_ok=True)
         with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA integrity_check")
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -180,7 +201,7 @@ def init_db():
                 )
             """)
             conn.commit()
-        logger.info("Database initialized")
+        logger.info("Database initialized and integrity checked")
     except Exception as e:
         logger.error(f"Database init error: {e}")
 
@@ -231,7 +252,9 @@ def get_all_users():
         with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id, usage_count, topic_id FROM users")
-            return [{"user_id": row[0], "usage_count": row[1], "topic_id": row[2]} for row in cursor.fetchall()]
+            users = [{"user_id": row[0], "usage_count": row[1], "topic_id": row[2]} for row in cursor.fetchall()]
+            logger.info(f"Retrieved {len(users)} users from database")
+            return users
     except Exception as e:
         logger.error(f"Get all users error: {e}")
         return []
@@ -300,6 +323,10 @@ async def create_user_topic(user, context: ContextTypes):
             return user_data["topic_id"]
         except Exception as e:
             logger.warning(f"Topic {user_data['topic_id']} for user {user_id} is invalid: {e}")
+            await context.bot.send_message(
+                chat_id=CONFIG["ADMIN_ID"],
+                text=f"Topic {user_data['topic_id']} for user {user_id} was invalid, creating new topic."
+            )
             manage_user_data(user_id, update_topic_id=None)
     
     try:
@@ -743,54 +770,62 @@ async def run_bot():
         logger.error(f"Bot initialization error: {e}")
         raise
 
-def handle_shutdown(loop, application, http_thread):
+async def handle_shutdown(application, http_thread):
     """Handle graceful shutdown."""
-    logger.info("Received shutdown signal, stopping bot and HTTP server")
-    if application:
-        loop.run_until_complete(application.stop())
-        loop.run_until_complete(application.shutdown())
-        logger.info("Bot stopped")
-    if http_thread:
-        http_thread.stop()
-        http_thread.join()
-        logger.info("HTTP server thread stopped")
-    if not loop.is_closed():
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        logger.info("Event loop closed")
+    with SHUTDOWN_LOCK:
+        logger.info("Initiating shutdown of bot and HTTP server")
+        try:
+            if application:
+                await application.updater.stop()
+                logger.info("Updater stopped")
+                await application.stop()
+                logger.info("Application stopped")
+                await application.shutdown()
+                logger.info("Application shutdown complete")
+            if http_thread:
+                http_thread.stop()
+                http_thread.join()
+                logger.info("HTTP server thread stopped")
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
 
 def main():
     """Run bot and HTTP server with graceful shutdown."""
     init_db()
     load_users_from_file()
-    logger.info("Starting bot and HTTP server")
+    logger.info(f"Database state: {get_all_users()}")
     
     http_thread = HTTPServerThread(CONFIG["HTTP_PORT"])
     try:
         http_thread.start()
-        logger.info("Health check server thread started")
+        time.sleep(1)  # Give the server time to bind
+        if not http_thread.success:
+            logger.error("HTTP server failed to start, continuing with bot")
     except Exception as e:
         logger.error(f"Failed to start HTTP server thread: {e}")
-        return
     
-    loop = asyncio.get_event_loop()
-    application = None
-    
+    async def main_coro():
+        application = None
+        try:
+            application = await run_bot()
+            await asyncio.Event().wait()  # Keep running until interrupted
+        finally:
+            await handle_shutdown(application, http_thread)
+
     def signal_handler(sig, frame):
         logger.info(f"Received signal {sig}")
-        handle_shutdown(loop, application, http_thread)
+        asyncio.create_task(handle_shutdown(application, http_thread))
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        application = loop.run_until_complete(run_bot())
-        loop.run_forever()
+        asyncio.run(main_coro())
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         logger.error(f"Bot runtime error: {e}")
-    finally:
-        handle_shutdown(loop, application, http_thread)
 
 if __name__ == "__main__":
     main()
