@@ -5,6 +5,7 @@ import sqlite3
 import warnings
 import uuid
 import os
+import signal
 from pathlib import Path
 from threading import Lock, Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -98,23 +99,36 @@ class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(b"Hello World!")
         logger.info("Health check request received")
 
-def run_http_server():
-    """Run HTTP server for health checks."""
-    try:
-        server = socketserver.TCPServer(("", CONFIG["HTTP_PORT"]), HealthCheckHandler)
-        server.allow_reuse_address = True
-        server.server_bind()
-        server.server_activate()
-        logger.info(f"HTTP server started on port {CONFIG['HTTP_PORT']}")
-        server.serve_forever()
-    except Exception as e:
-        logger.error(f"HTTP server error: {e}")
+class HTTPServerThread(Thread):
+    """Thread to run HTTP server with shutdown capability."""
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.port = port
+        self.server = None
+
+    def run(self):
+        try:
+            self.server = socketserver.TCPServer(("", self.port), HealthCheckHandler)
+            self.server.allow_reuse_address = True
+            self.server.server_bind()
+            self.server.server_activate()
+            logger.info(f"HTTP server started on port {self.port}")
+            self.server.serve_forever()
+        except Exception as e:
+            logger.error(f"HTTP server error: {e}")
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            logger.info("HTTP server stopped")
 
 # Database and file handling
 def manage_user_data(user_id, update_usage=None, update_topic_id=None):
     """Manage user data in SQLite database."""
     try:
-        with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
             cursor = conn.cursor()
             cursor.execute("SELECT usage_count, topic_id FROM users WHERE user_id = ?", (user_id,))
             result = cursor.fetchone()
@@ -154,9 +168,9 @@ def manage_user_data(user_id, update_usage=None, update_topic_id=None):
 def init_db():
     """Initialize SQLite database."""
     try:
-        # Ensure data directory exists
         Path(CONFIG["DATA_DIR"]).mkdir(exist_ok=True)
-        with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -194,7 +208,8 @@ def load_users_from_file():
                 except ValueError:
                     logger.warning(f"Invalid user ID in file: {stripped}")
 
-        with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.cursor()
             for user_id in user_ids:
                 cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
@@ -213,7 +228,7 @@ def load_users_from_file():
 def get_all_users():
     """Get all users' data from database."""
     try:
-        with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id, usage_count, topic_id FROM users")
             return [{"user_id": row[0], "usage_count": row[1], "topic_id": row[2]} for row in cursor.fetchall()]
@@ -224,7 +239,7 @@ def get_all_users():
 def get_user_by_topic(topic_id):
     """Get user_id by topic_id from database."""
     try:
-        with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users WHERE topic_id = ?", (topic_id,))
             result = cursor.fetchone()
@@ -275,7 +290,6 @@ async def create_user_topic(user, context: ContextTypes):
     user_data = manage_user_data(user_id)
     
     if user_data["topic_id"]:
-        # Verify topic exists in Telegram
         try:
             await context.bot.send_chat_action(
                 chat_id=CONFIG["GROUP_CHAT_ID"],
@@ -286,11 +300,9 @@ async def create_user_topic(user, context: ContextTypes):
             return user_data["topic_id"]
         except Exception as e:
             logger.warning(f"Topic {user_data['topic_id']} for user {user_id} is invalid: {e}")
-            # Clear invalid topic_id and create a new one
             manage_user_data(user_id, update_topic_id=None)
     
     try:
-        # Create a new topic in the group
         topic = await context.bot.create_forum_topic(
             chat_id=CONFIG["GROUP_CHAT_ID"],
             name=f"User {user.full_name or user_id}"
@@ -298,7 +310,6 @@ async def create_user_topic(user, context: ContextTypes):
         topic_id = topic.message_thread_id
         manage_user_data(user_id, update_topic_id=topic_id)
         
-        # Get user profile photo
         profile_photo = None
         try:
             photos = await context.bot.get_user_profile_photos(user_id, limit=1)
@@ -307,7 +318,6 @@ async def create_user_topic(user, context: ContextTypes):
         except Exception as e:
             logger.error(f"Error fetching profile photo for user {user_id}: {e}")
         
-        # Post user info with hyperlink
         user_info = f"User Info:\nFull Name: {user.full_name}\n<a href=\"tg://user?id={user_id}\">User ID: {user_id}</a>"
         
         if profile_photo:
@@ -332,7 +342,7 @@ async def start_command(update: Update, context: ContextTypes) -> None:
     logger.info(f"User {user_id} started bot")
     
     try:
-        manage_user_data(user_id)  # Ensure user is in db
+        manage_user_data(user_id)
         topic_id = await create_user_topic(update.effective_user, context)
         
         if not topic_id:
@@ -508,7 +518,7 @@ async def gen_command(update: Update, context: ContextTypes) -> None:
     lang = get_user_language(user_id)
     logger.info(f"User {user_id} initiated /gen")
     
-    manage_user_data(user_id)  # Ensure user is in db
+    manage_user_data(user_id)
     topic_id = await create_user_topic(update.effective_user, context)
     
     await forward_to_topic(update, context, topic_id)
@@ -525,7 +535,7 @@ async def handle_message(update: Update, context: ContextTypes) -> None:
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     
-    manage_user_data(user_id)  # Ensure user is in db
+    manage_user_data(user_id)
     topic_id = await create_user_topic(update.effective_user, context)
     
     await forward_to_topic(update, context, topic_id)
@@ -709,26 +719,8 @@ async def error_handler(update: Update, context: ContextTypes) -> None:
     if isinstance(error, ReadError):
         logger.warning(f"ReadError details: {error.request.url if hasattr(error, 'request') else 'No request info'}")
 
-def main():
-    """Run bot and HTTP server."""
-    init_db()
-    load_users_from_file()
-    logger.info("Starting bot and HTTP server")
-    
-    # Start HTTP server in a separate thread
-    http_thread = Thread(target=run_http_server, daemon=True)
-    try:
-        http_thread.start()
-        logger.info("Health check server thread started")
-    except Exception as e:
-        logger.error(f"Failed to start HTTP server thread: {e}")
-        return
-    
-    # Create new event loop for bot
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Initialize and run bot
+async def run_bot():
+    """Run the Telegram bot."""
     try:
         application = Application.builder().token(CONFIG["BOT_TOKEN"]).build()
         
@@ -742,12 +734,63 @@ def main():
         application.add_error_handler(error_handler)
         
         logger.info("Starting bot polling")
-        loop.run_until_complete(application.run_polling())
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        
+        return application
     except Exception as e:
-        logger.error(f"Bot initialization or polling error: {e}")
-    finally:
+        logger.error(f"Bot initialization error: {e}")
+        raise
+
+def handle_shutdown(loop, application, http_thread):
+    """Handle graceful shutdown."""
+    logger.info("Received shutdown signal, stopping bot and HTTP server")
+    if application:
+        loop.run_until_complete(application.stop())
+        loop.run_until_complete(application.shutdown())
+        logger.info("Bot stopped")
+    if http_thread:
+        http_thread.stop()
+        http_thread.join()
+        logger.info("HTTP server thread stopped")
+    if not loop.is_closed():
+        loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
         logger.info("Event loop closed")
+
+def main():
+    """Run bot and HTTP server with graceful shutdown."""
+    init_db()
+    load_users_from_file()
+    logger.info("Starting bot and HTTP server")
+    
+    http_thread = HTTPServerThread(CONFIG["HTTP_PORT"])
+    try:
+        http_thread.start()
+        logger.info("Health check server thread started")
+    except Exception as e:
+        logger.error(f"Failed to start HTTP server thread: {e}")
+        return
+    
+    loop = asyncio.get_event_loop()
+    application = None
+    
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}")
+        handle_shutdown(loop, application, http_thread)
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        application = loop.run_until_complete(run_bot())
+        loop.run_forever()
+    except Exception as e:
+        logger.error(f"Bot runtime error: {e}")
+    finally:
+        handle_shutdown(loop, application, http_thread)
 
 if __name__ == "__main__":
     main()
