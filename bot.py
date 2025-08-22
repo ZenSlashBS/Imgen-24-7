@@ -137,9 +137,12 @@ def acquire_lock():
 def release_lock(fd):
     """Release the lock file."""
     try:
-        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-        fd.close()
-        logger.info("Released bot instance lock")
+        if fd and not fd.closed:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            fd.close()
+            logger.info("Released bot instance lock")
+        else:
+            logger.warning("Lock file descriptor already closed")
     except Exception as e:
         logger.error(f"Error releasing lock: {e}")
 
@@ -844,25 +847,41 @@ def main():
         finally:
             await handle_shutdown(application, http_runner, lock_fd)
 
-    def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}")
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(handle_shutdown(None, None, lock_fd))
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
+    loop = asyncio.get_event_loop()
     try:
-        asyncio.run(main_coro())
+        loop.run_until_complete(main_coro())
     except KeyboardInterrupt:
-        pass
+        logger.info("Received KeyboardInterrupt, shutting down")
+        loop.run_until_complete(handle_shutdown(None, None, lock_fd))
     except Exception as e:
         logger.error(f"Bot runtime error: {e}")
         if lock_fd:
             release_lock(lock_fd)
+    finally:
+        if not loop.is_closed():
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}, shutting down")
+        nonlocal loop, lock_fd
+        if not loop.is_closed():
+            try:
+                if loop.is_running():
+                    loop.stop()
+                tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task(loop)]
+                for task in tasks:
+                    task.cancel()
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(handle_shutdown(None, None, lock_fd))
+            except Exception as e:
+                logger.error(f"Signal handler error: {e}")
+            finally:
+                loop.close()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
     main()
