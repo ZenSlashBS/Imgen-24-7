@@ -15,12 +15,15 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-from threading import Lock
+from threading import Lock, Thread
 from requests.exceptions import ConnectionError, RequestException
 from httpx import ReadError
 import requests
 import time
 import re
+import os
+from http.server import SimpleHTTPRequestHandler
+import socketserver
 
 # Suppress DeprecationWarning for event loop
 warnings.filterwarnings("ignore", category=DeprecationWarning, message="There is no current event loop")
@@ -281,19 +284,23 @@ async def start_command(update: Update, context: ContextTypes) -> None:
     """Handle /start."""
     user_id = update.effective_user.id
     lang = get_user_language(user_id)
-    logger.info(f"User {user_id} started bot")
-    
-    manage_user_data(user_id)  # Ensure user is in db
-    topic_id = await create_user_topic(update.effective_user, context)
-    
-    await forward_to_topic(update, context, topic_id)
-    
-    keyboard = [[InlineKeyboardButton("Support ⭐", url=CONFIG["SUPPORT_URL"])]]
-    await update.message.reply_text(
-        lang["welcome"],
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    await send_to_topic(context, topic_id, text=lang["welcome"], reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        logger.info(f"User {user_id} started bot")
+        
+        manage_user_data(user_id)  # Ensure user is in db
+        topic_id = await create_user_topic(update.effective_user, context)
+        
+        await forward_to_topic(update, context, topic_id)
+        
+        keyboard = [[InlineKeyboardButton("Support ⭐", url=CONFIG["SUPPORT_URL"])]]
+        await update.message.reply_text(
+            lang["welcome"],
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        await send_to_topic(context, topic_id, text=lang["welcome"], reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Error in start_command for user {user_id}: {e}")
+        await update.message.reply_text(lang["error"].format("Unexpected error occurred. Please try again."))
 
 async def users_command(update: Update, context: ContextTypes) -> None:
     """Handle /users to send users.txt with number of users and user IDs (admin only)."""
@@ -655,28 +662,51 @@ async def error_handler(update: Update, context: ContextTypes) -> None:
     if isinstance(error, ReadError):
         logger.warning(f"ReadError details: {error.request.url if hasattr(error, 'request') else 'No request info'}")
 
+class HealthCheckHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"Hello World!")
+
+def run_http_server():
+    PORT = int(os.environ.get('PORT', 8000))
+    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
+        httpd.allow_reuse_address = True
+        httpd.server_bind()
+        httpd.server_activate()
+        logger.info(f"Serving HTTP at port {PORT}")
+        httpd.serve_forever()
+
 def main():
     """Run bot."""
     init_db()
     load_users_from_file()
     logger.info("Starting bot")
     
+    # Start HTTP server in a separate thread
+    http_thread = Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    application = Application.builder().token(CONFIG["BOT_TOKEN"]).build()
-    
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("gen", gen_command))
-    application.add_handler(CommandHandler("users", users_command))
-    application.add_handler(CommandHandler("bro", broadcast_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-    application.add_handler(MessageHandler(filters.Chat(CONFIG["GROUP_CHAT_ID"]) & filters.User(CONFIG["ADMIN_ID"]), handle_admin_message_in_topic))
-    application.add_error_handler(error_handler)
-    
-    logger.info("Starting bot polling")
-    loop.run_until_complete(application.run_polling())
+    try:
+        application = Application.builder().token(CONFIG["BOT_TOKEN"]).build()
+        
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("gen", gen_command))
+        application.add_handler(CommandHandler("users", users_command))
+        application.add_handler(CommandHandler("bro", broadcast_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
+        application.add_handler(CallbackQueryHandler(handle_callback_query))
+        application.add_handler(MessageHandler(filters.Chat(CONFIG["GROUP_CHAT_ID"]) & filters.User(CONFIG["ADMIN_ID"]), handle_admin_message_in_topic))
+        application.add_error_handler(error_handler)
+        
+        logger.info("Starting bot polling")
+        loop.run_until_complete(application.run_polling())
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
 
 if __name__ == "__main__":
     main()
