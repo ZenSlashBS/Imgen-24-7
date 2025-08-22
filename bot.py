@@ -97,13 +97,21 @@ USER_STATE = {}  # User states for conversation flow
 # HTTP Server for Health Check using aiohttp
 async def health_check(request):
     """Handle health check requests."""
-    logger.info("Health check request received")
+    logger.info("Health check request received on /")
+    return web.Response(text="OK")
+
+async def health_endpoint(request):
+    """Handle explicit health check endpoint."""
+    logger.info("Health check request received on /health")
     return web.Response(text="OK")
 
 async def start_http_server(port):
     """Start aiohttp server for health checks."""
     app = web.Application()
-    app.add_routes([web.get('/', health_check)])
+    app.add_routes([
+        web.get('/', health_check),
+        web.get('/health', health_endpoint)
+    ])
     runner = web.AppRunner(app)
     await runner.setup()
     
@@ -142,7 +150,7 @@ def release_lock(fd):
             fd.close()
             logger.info("Released bot instance lock")
         else:
-            logger.warning("Lock file descriptor already closed")
+            logger.warning("Lock file descriptor already closed or None")
     except Exception as e:
         logger.error(f"Error releasing lock: {e}")
 
@@ -648,7 +656,7 @@ async def handle_callback_query(update: Update, context: ContextTypes) -> None:
         prompt = context.user_data.get("prompt")
         dimension = context.user_data.get("dimension")
         
-        manage_user_data(user_id, update_usage=user_data["usage_count"] + 1)  # Fixed: Only update usage_count
+        manage_user_data(user_id, update_usage=user_data["usage_count"] + 1)
         generating_message = await query.message.edit_text(lang["generating"])
         await send_to_topic(context, topic_id, text=lang["generating"])
         
@@ -819,6 +827,8 @@ async def handle_shutdown(application, http_runner, lock_fd):
                 logger.info("Lock file released")
         except Exception as e:
             logger.error(f"Shutdown error: {e}")
+        finally:
+            logger.info("Shutdown process completed")
 
 def main():
     """Run bot and HTTP server with graceful shutdown."""
