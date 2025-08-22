@@ -8,7 +8,9 @@ import os
 import signal
 import fcntl
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
@@ -25,7 +27,6 @@ from httpx import ReadError
 import requests
 import time
 import re
-from aiohttp import web
 
 # Suppress DeprecationWarning for event loop
 warnings.filterwarnings("ignore", category=DeprecationWarning, message="There is no current event loop")
@@ -94,39 +95,34 @@ DATA_LOCK = Lock()
 SHUTDOWN_LOCK = Lock()
 USER_STATE = {}  # User states for conversation flow
 
-# HTTP Server for Health Check using aiohttp
-async def health_check(request):
-    """Handle health check requests."""
-    logger.info("Health check request received on /")
-    return web.Response(text="OK")
+# HTTP Server for Health Check using http.server and socketserver
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ['/', '/health']:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Hello World!")
+            logger.info(f"Health check request received on {self.path}")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
-async def health_endpoint(request):
-    """Handle explicit health check endpoint."""
-    logger.info("Health check request received on /health")
-    return web.Response(text="OK")
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
 
-async def start_http_server(port):
-    """Start aiohttp server for health checks."""
-    app = web.Application()
-    app.add_routes([
-        web.get('/', health_check),
-        web.get('/health', health_endpoint)
-    ])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    for attempt in range(3):
-        try:
-            site = web.TCPSite(runner, '0.0.0.0', port + attempt)
-            await site.start()
-            logger.info(f"HTTP server started on port {port + attempt}")
-            return runner
-        except OSError as e:
-            logger.error(f"HTTP server attempt {attempt + 1}/3 failed on port {port + attempt}: {e}")
-            if attempt < 2:
-                await asyncio.sleep(1)
-    logger.error("Failed to start HTTP server after 3 attempts")
-    return None
+def start_http_server(port):
+    """Start HTTP server in a separate thread."""
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    try:
+        server.server_bind()
+        server.server_activate()
+        logger.info(f"HTTP server started on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"HTTP server failed on port {port}: {e}")
+        raise
+    return server
 
 # Lock file management
 def acquire_lock():
@@ -191,7 +187,6 @@ def manage_user_data(user_id, update_usage=None, update_topic_id=None):
                 logger.info(f"Updated user {user_id}: usage_count={update_usage}, topic_id={update_topic_id}")
             
             conn.commit()
-            # Verify write
             cursor.execute("SELECT usage_count, topic_id FROM users WHERE user_id = ?", (user_id,))
             result = cursor.fetchone()
             logger.info(f"Verified user {user_id}: usage_count={result[0]}, topic_id={result[1]}")
@@ -807,7 +802,7 @@ async def run_bot():
         logger.error(f"Bot initialization error: {e}")
         raise
 
-async def handle_shutdown(application, http_runner, lock_fd):
+async def handle_shutdown(application, http_server, http_thread, lock_fd):
     """Handle graceful shutdown."""
     with SHUTDOWN_LOCK:
         logger.info("Initiating shutdown of bot and HTTP server")
@@ -819,9 +814,13 @@ async def handle_shutdown(application, http_runner, lock_fd):
                 logger.info("Application stopped")
                 await application.shutdown()
                 logger.info("Application shutdown complete")
-            if http_runner:
-                await http_runner.cleanup()
+            if http_server:
+                http_server.server_close()
                 logger.info("HTTP server stopped")
+            if http_thread:
+                http_server.shutdown()
+                http_thread.join(timeout=5.0)
+                logger.info("HTTP server thread stopped")
             if lock_fd:
                 release_lock(lock_fd)
                 logger.info("Lock file released")
@@ -833,19 +832,34 @@ async def handle_shutdown(application, http_runner, lock_fd):
 def main():
     """Run bot and HTTP server with graceful shutdown."""
     lock_fd = acquire_lock()
+    http_server = None
+    http_thread = None
     
     init_db()
     load_users_from_file()
     logger.info(f"Database state: {get_all_users()}")
     
+    # Start HTTP server in a separate thread
+    for port in range(CONFIG["HTTP_PORT"], CONFIG["HTTP_PORT"] + 3):
+        try:
+            http_server = ThreadingHTTPServer(('0.0.0.0', port), HealthCheckHandler)
+            http_server.allow_reuse_address = True
+            http_thread = Thread(target=http_server.serve_forever, daemon=True)
+            http_thread.start()
+            logger.info(f"HTTP server started on port {port}")
+            break
+        except Exception as e:
+            logger.error(f"HTTP server attempt failed on port {port}: {e}")
+            if port < CONFIG["HTTP_PORT"] + 2:
+                time.sleep(1)
+            else:
+                logger.error("Failed to start HTTP server after 3 attempts")
+                http_server = None
+                break
+    
     async def main_coro():
         application = None
-        http_runner = None
         try:
-            http_runner = await start_http_server(CONFIG["HTTP_PORT"])
-            if not http_runner:
-                logger.warning("HTTP server failed to start, continuing with bot")
-            
             application = await run_bot()
             await asyncio.Event().wait()  # Keep running until interrupted
         except Conflict:
@@ -855,14 +869,15 @@ def main():
             logger.error(f"Main coroutine error: {e}")
             sys.exit(1)
         finally:
-            await handle_shutdown(application, http_runner, lock_fd)
+            await handle_shutdown(application, http_server, http_thread, lock_fd)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(main_coro())
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down")
-        loop.run_until_complete(handle_shutdown(None, None, lock_fd))
+        loop.run_until_complete(handle_shutdown(None, http_server, http_thread, lock_fd))
     except Exception as e:
         logger.error(f"Bot runtime error: {e}")
         if lock_fd:
@@ -874,7 +889,7 @@ def main():
 
     def signal_handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down")
-        nonlocal loop, lock_fd
+        nonlocal loop, http_server, http_thread, lock_fd
         if not loop.is_closed():
             try:
                 if loop.is_running():
@@ -883,7 +898,7 @@ def main():
                 for task in tasks:
                     task.cancel()
                 loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(handle_shutdown(None, None, lock_fd))
+                loop.run_until_complete(handle_shutdown(None, http_server, http_thread, lock_fd))
             except Exception as e:
                 logger.error(f"Signal handler error: {e}")
             finally:
