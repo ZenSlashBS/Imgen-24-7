@@ -1,5 +1,3 @@
-http.server
-socketserver
 python-telegram-bot
 requests
 httpx
