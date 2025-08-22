@@ -6,6 +6,7 @@ import warnings
 import uuid
 import os
 import signal
+import fcntl
 from pathlib import Path
 from threading import Lock, Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,6 +19,7 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
+from telegram.error import Conflict
 from requests.exceptions import ConnectionError, RequestException
 from httpx import ReadError
 import requests
@@ -52,7 +54,8 @@ CONFIG = {
     "DB_FILE": os.environ.get("DB_FILE", "/app/data/users.db"),
     "DATA_DIR": os.environ.get("DATA_DIR", "/app/data"),
     "USERS_FILE": os.environ.get("USERS_FILE", "users.txt"),
-    "HTTP_PORT": int(os.environ.get("PORT", 8000))
+    "HTTP_PORT": int(os.environ.get("PORT", 8080)),  # Default to 8080
+    "LOCK_FILE": os.environ.get("LOCK_FILE", "/app/data/bot.lock")
 }
 CONFIG["BOT_USER_ID"] = int(CONFIG["BOT_TOKEN"].split(':')[0])
 
@@ -114,12 +117,10 @@ class HTTPServerThread(Thread):
             try:
                 # Check if port is available
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     s.settimeout(1)
-                    result = s.connect_ex(('0.0.0.0', self.port))
-                    if result == 0:
-                        logger.warning(f"Port {self.port} is already in use, retrying in 1s")
-                        time.sleep(1)
-                        continue
+                    result = s.bind(('0.0.0.0', self.port))
+                    logger.info(f"Port {self.port} is available")
                 
                 self.server = socketserver.TCPServer(("", self.port), HealthCheckHandler)
                 self.server.allow_reuse_address = True
@@ -142,6 +143,29 @@ class HTTPServerThread(Thread):
             self.server.shutdown()
             self.server.server_close()
             logger.info("HTTP server stopped")
+
+# Lock file management
+def acquire_lock():
+    """Acquire a lock to ensure single bot instance."""
+    lock_file = Path(CONFIG["LOCK_FILE"])
+    lock_file.parent.mkdir(exist_ok=True)
+    try:
+        fd = open(lock_file, 'w')
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("Acquired bot instance lock")
+        return fd
+    except IOError as e:
+        logger.error(f"Failed to acquire lock, another instance may be running: {e}")
+        sys.exit(1)
+
+def release_lock(fd):
+    """Release the lock file."""
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        fd.close()
+        logger.info("Released bot instance lock")
+    except Exception as e:
+        logger.error(f"Error releasing lock: {e}")
 
 # Database and file handling
 def manage_user_data(user_id, update_usage=None, update_topic_id=None):
@@ -180,7 +204,11 @@ def manage_user_data(user_id, update_usage=None, update_topic_id=None):
                 logger.info(f"Updated user {user_id}: usage_count={update_usage}, topic_id={update_topic_id}")
             
             conn.commit()
-            return {"usage_count": usage_count, "topic_id": topic_id}
+            # Verify write
+            cursor.execute("SELECT usage_count, topic_id FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            logger.info(f"Verified user {user_id}: usage_count={result[0]}, topic_id={result[1]}")
+            return {"usage_count": result[0], "topic_id": result[1]}
     except Exception as e:
         logger.error(f"User data error for user {user_id}: {e}")
         return {"usage_count": 0, "topic_id": None}
@@ -241,7 +269,6 @@ def load_users_from_file():
                     )
                     logger.info(f"Loaded user {user_id} from users.txt into database")
             conn.commit()
-
         logger.info(f"Loaded {len(user_ids)} users from users.txt")
     except Exception as e:
         logger.error(f"Error loading users from file: {e}")
@@ -745,6 +772,9 @@ async def error_handler(update: Update, context: ContextTypes) -> None:
     logger.error(f"Update {update} caused error {type(error).__name__}: {error}")
     if isinstance(error, ReadError):
         logger.warning(f"ReadError details: {error.request.url if hasattr(error, 'request') else 'No request info'}")
+    if isinstance(error, Conflict):
+        logger.error("Conflict error detected, stopping bot")
+        raise error
 
 async def run_bot():
     """Run the Telegram bot."""
@@ -762,15 +792,19 @@ async def run_bot():
         
         logger.info("Starting bot polling")
         await application.initialize()
+        await application.bot.delete_webhook(drop_pending_updates=True)
         await application.start()
         await application.updater.start_polling(drop_pending_updates=True)
         
         return application
+    except Conflict as e:
+        logger.error(f"Bot initialization failed due to conflict: {e}")
+        raise
     except Exception as e:
         logger.error(f"Bot initialization error: {e}")
         raise
 
-async def handle_shutdown(application, http_thread):
+async def handle_shutdown(application, http_thread, lock_fd):
     """Handle graceful shutdown."""
     with SHUTDOWN_LOCK:
         logger.info("Initiating shutdown of bot and HTTP server")
@@ -786,11 +820,16 @@ async def handle_shutdown(application, http_thread):
                 http_thread.stop()
                 http_thread.join()
                 logger.info("HTTP server thread stopped")
+            if lock_fd:
+                release_lock(lock_fd)
+                logger.info("Lock file released")
         except Exception as e:
             logger.error(f"Shutdown error: {e}")
 
 def main():
     """Run bot and HTTP server with graceful shutdown."""
+    lock_fd = acquire_lock()
+    
     init_db()
     load_users_from_file()
     logger.info(f"Database state: {get_all_users()}")
@@ -800,7 +839,7 @@ def main():
         http_thread.start()
         time.sleep(1)  # Give the server time to bind
         if not http_thread.success:
-            logger.error("HTTP server failed to start, continuing with bot")
+            logger.warning("HTTP server failed to start, continuing with bot")
     except Exception as e:
         logger.error(f"Failed to start HTTP server thread: {e}")
     
@@ -809,12 +848,15 @@ def main():
         try:
             application = await run_bot()
             await asyncio.Event().wait()  # Keep running until interrupted
+        except Conflict:
+            logger.error("Exiting due to conflict error")
+            sys.exit(1)
         finally:
-            await handle_shutdown(application, http_thread)
+            await handle_shutdown(application, http_thread, lock_fd)
 
     def signal_handler(sig, frame):
         logger.info(f"Received signal {sig}")
-        asyncio.create_task(handle_shutdown(application, http_thread))
+        asyncio.create_task(handle_shutdown(None, http_thread, lock_fd))
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -826,6 +868,8 @@ def main():
         pass
     except Exception as e:
         logger.error(f"Bot runtime error: {e}")
+        if lock_fd:
+            release_lock(lock_fd)
 
 if __name__ == "__main__":
     main()
