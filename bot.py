@@ -46,7 +46,7 @@ CONFIG = {
     "GROUP_CHAT_ID": -1002659852650,
     "VERIFY_IMAGE_URL": False,
     "SUPPORT_URL": "t.me/hazexpy",
-    "ADMIN_ID": 7067323341,
+    "ADMIN_ID": 8315454125,
     "DB_FILE": "users.db",
     "DATA_DIR": "data",
     "USERS_FILE": "users.txt"
